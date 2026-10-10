@@ -5,6 +5,7 @@ import { useLanguage } from '@/context/LanguageContext';
 import { createClient } from '@/lib/supabase';
 import AdminNav from '@/components/main/AdminNav';
 import ConfirmModal from '@/components/main/ConfirmModal';
+import AppointmentFilters from '@/components/main/AppointmentFilters';
 import { formatDisplay } from '@/lib/phone';
 
 const PER_PAGE = 30;
@@ -28,6 +29,60 @@ const STATUS_DOT_COLORS = {
   no_show: 'bg-gray-400',
 };
 
+const DEFAULT_FILTERS = { search: '', status: 'all', period: 'all', from: '', to: '', sort: 'default' };
+
+// Local YYYY-MM-DD (toISOString would shift to UTC)
+function todayISO() {
+  const now = new Date();
+  return [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function filterAppointments(appointments, filters) {
+  const today = todayISO();
+  const query = filters.search.trim().toLowerCase();
+  const queryDigits = query.replace(/\D/g, '');
+
+  return appointments.filter(apt => {
+    const status = apt.status || 'pending';
+    if (filters.status !== 'all' && status !== filters.status) return false;
+
+    if (filters.period === 'today' && apt.date !== today) return false;
+    if (filters.period === 'upcoming' && apt.date < today) return false;
+    if (filters.period === 'past' && apt.date >= today) return false;
+
+    if (filters.from && apt.date < filters.from) return false;
+    if (filters.to && apt.date > filters.to) return false;
+
+    if (query) {
+      const text = [apt.name, apt.email, apt.message].filter(Boolean).join(' ').toLowerCase();
+      const phoneMatch = queryDigits && (apt.phone || '').replace(/\D/g, '').includes(queryDigits);
+      if (!text.includes(query) && !phoneMatch) return false;
+    }
+
+    return true;
+  });
+}
+
+function compareDateTime(a, b) {
+  return a.date.localeCompare(b.date) || (a.time || '').localeCompare(b.time || '');
+}
+
+function sortAppointments(appointments, sort) {
+  // 'default' keeps the fetch order: upcoming first, then past
+  if (sort === 'default') return appointments;
+
+  const sorted = [...appointments];
+  if (sort === 'dateAsc') sorted.sort(compareDateTime);
+  if (sort === 'dateDesc') sorted.sort((a, b) => compareDateTime(b, a));
+  if (sort === 'nameAsc') sorted.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  if (sort === 'createdDesc') sorted.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+  return sorted;
+}
+
 export default function Appointments() {
   const { user, loading } = useAuth();
   const { t, locale } = useLanguage();
@@ -38,9 +93,22 @@ export default function Appointments() {
   const [fetching, setFetching] = useState(true);
   const [page, setPage] = useState(1);
   const [deleteId, setDeleteId] = useState(null);
+  const [filters, setFilters] = useState(DEFAULT_FILTERS);
 
-  const totalPages = Math.ceil(appointments.length / PER_PAGE);
-  const paginatedAppointments = appointments.slice((page - 1) * PER_PAGE, page * PER_PAGE);
+  const visibleAppointments = useMemo(
+    () => sortAppointments(filterAppointments(appointments, filters), filters.sort),
+    [appointments, filters]
+  );
+  const isFiltered = Object.keys(DEFAULT_FILTERS).some(key => filters[key] !== DEFAULT_FILTERS[key]);
+
+  const totalPages = Math.ceil(visibleAppointments.length / PER_PAGE);
+  const currentPage = Math.min(page, totalPages || 1);
+  const paginatedAppointments = visibleAppointments.slice((currentPage - 1) * PER_PAGE, currentPage * PER_PAGE);
+
+  function handleFiltersChange(nextFilters) {
+    setFilters(nextFilters);
+    setPage(1);
+  }
 
   useEffect(() => {
     if (!loading && !user) {
@@ -48,23 +116,42 @@ export default function Appointments() {
     }
   }, [user, loading, router]);
 
+  // Upcoming appointments first (soonest at top), then past ones (most recent first)
+  async function fetchAppointments() {
+    const today = todayISO();
+
+    const [upcoming, past] = await Promise.all([
+      supabase
+        .from('appointments')
+        .select('*')
+        .gte('date', today)
+        .order('date', { ascending: true })
+        .order('time', { ascending: true }),
+      supabase
+        .from('appointments')
+        .select('*')
+        .lt('date', today)
+        .order('date', { ascending: false })
+        .order('time', { ascending: false }),
+    ]);
+
+    if (upcoming.error || past.error) return null;
+    return [...upcoming.data, ...past.data];
+  }
+
   useEffect(() => {
     if (!user) return;
 
     async function load() {
-      const { data, error } = await supabase
-        .from('appointments')
-        .select('*')
-        .order('date', { ascending: true })
-        .order('time', { ascending: true });
-
-      if (!error && data) {
+      const data = await fetchAppointments();
+      if (data) {
         setAppointments(data);
       }
       setFetching(false);
     }
 
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, supabase]);
 
   if (loading || !user) {
@@ -87,11 +174,7 @@ export default function Appointments() {
 
     const res = await fetch(`/api/appointments/${id}`, { method: 'DELETE' });
     if (!res.ok) {
-      const { data } = await supabase
-        .from('appointments')
-        .select('*')
-        .order('date', { ascending: true })
-        .order('time', { ascending: true });
+      const data = await fetchAppointments();
       if (data) setAppointments(data);
     }
   }
@@ -149,6 +232,19 @@ export default function Appointments() {
           <p className="text-gold-dark">{t('admin.appointments.empty')}</p>
         ) : (
           <>
+          <AppointmentFilters
+            filters={filters}
+            onChange={handleFiltersChange}
+            onReset={() => handleFiltersChange(DEFAULT_FILTERS)}
+            statuses={STATUSES}
+            resultCount={visibleAppointments.length}
+            isDirty={isFiltered}
+          />
+
+          {visibleAppointments.length === 0 && (
+            <p className="text-gold-dark">{t('admin.filters.noMatches')}</p>
+          )}
+
           <div className="flex flex-col gap-4 lg:hidden">
             {paginatedAppointments.map((apt) => (
               <div key={apt.id} className="bg-white rounded-xl p-4 space-y-3">
@@ -259,18 +355,18 @@ export default function Appointments() {
           {totalPages > 1 && (
             <div className="flex items-center justify-center gap-4 mt-6">
               <button
-                onClick={() => setPage(p => Math.max(1, p - 1))}
-                disabled={page === 1}
+                onClick={() => setPage(Math.max(1, currentPage - 1))}
+                disabled={currentPage === 1}
                 className="text-sm font-semibold text-gold-dark border-2 border-gold-light rounded-full px-4 py-2 disabled:opacity-30"
               >
                 &larr;
               </button>
               <span className="text-sm text-gold-dark">
-                {t('admin.appointments.page')} {page} {t('admin.appointments.of')} {totalPages}
+                {t('admin.appointments.page')} {currentPage} {t('admin.appointments.of')} {totalPages}
               </span>
               <button
-                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                disabled={page === totalPages}
+                onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+                disabled={currentPage === totalPages}
                 className="text-sm font-semibold text-gold-dark border-2 border-gold-light rounded-full px-4 py-2 disabled:opacity-30"
               >
                 &rarr;
